@@ -1,0 +1,12 @@
+/list.txt
+/.idea/
+/target/
+/output/
+/repos/
+/logs/
+/gitMergeScenario.iml
+.vscode/
+# MacOS
+.DS_Store
+collect_output
+/debug/
