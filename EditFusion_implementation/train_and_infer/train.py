@@ -1,194 +1,135 @@
-from collections import defaultdict
-from typing import List
-import pandas as pd
-from pathlib import Path
-import torch
-import torch.optim as optim
-from tqdm import tqdm
-import os
+from .model.CCEmbedding.MergeBertCCEmbedding import MergeBertCCEmbedding
+from .model.CCEmbedding.PretrainedCCEmbedding import PretrainedCCEmbedding
+from .model.CCEmbedding.PretrainedCCEmbedding_linear import PretrainedCCEmbedding_linear
+from .model.CCEmbedding.PretrainedCCEmbedding_seq import PretrainedCCEmbeddingSeq
+from .trainers.LSTMTrainer import LSTMTrainer
+from .trainers.GRUTrainer import GRUTrainer
+from .model.LSTM_model import LSTMClassifier
+from .model.GRU_model import GRUClassifier
+from .params import model_params, training_param
+from accelerate import Accelerator, DistributedDataParallelKwargs
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split, Subset
-
-from .model.LSTM_model import LSTMClassifier, model_params
-from .utils.tokenizer_util import pad_token_id
-from .utils.util import ObjectDict
-
-training_param = ObjectDict({
-    'TRAIN_SPLIT': 0.8,
-    'learning_rate': 5e-6,
-    'epochs': 5,
-    'batch_size': 2,
-})
-# Build Dataset
-class EditScriptDataset(Dataset):
-    def __init__(self, dataframe):
-        self.dataframe = dataframe
-        self.block_ids = dataframe['block_id'].unique()
-
-    def __len__(self):
-        return len(self.block_ids)
-
-    def __getitem__(self, idx):
-        block_id = self.block_ids[idx]
-        target_edit_script = self.dataframe[self.dataframe['block_id'] == block_id] # Get all edit scripts for current block_id
-        resolution_kind = target_edit_script['resolution_kind'].iloc[0]
-
-        # Separate labels
-        labels = target_edit_script['accept'].values
-
-        # Extract position and length features
-        position_features = target_edit_script[['origin_start', 'origin_end', 'modified_start', 'modified_end']].copy()
-        position_features['origin_length'] = position_features['origin_end'] - position_features['origin_start']
-        position_features['modified_length'] = position_features['modified_end'] - position_features['modified_start']
-        position_features['length_difference'] = position_features['modified_length'] - position_features['origin_length']
-        # Extract three code change sequences; note: written as string, so need eval when reading
-        _origin_processed_ids = list(map(eval, target_edit_script['origin_processed_ids'].values))
-        _modified_processed_ids = list(map(eval, target_edit_script['modified_processed_ids'].values))
-        _edit_seq_processed_ids = list(map(eval, target_edit_script['edit_seq_processed_ids'].values))
-
-        # Convert to tensor
-        position_features = torch.tensor(position_features.values, dtype=torch.float)
-        labels_tensor = torch.tensor(labels, dtype=torch.float)
-        origin_processed_ids = torch.tensor(_origin_processed_ids, dtype=torch.long)
-        modified_processed_ids = torch.tensor(_modified_processed_ids, dtype=torch.long)
-        edit_seq_processed_ids = torch.tensor(_edit_seq_processed_ids, dtype=torch.long)
-
-        return position_features, (origin_processed_ids, modified_processed_ids, edit_seq_processed_ids), labels_tensor, len(target_edit_script), resolution_kind
-
-def collate_fn(batch):
-    batch.sort(key=lambda x: x[3], reverse=True)  # Sort by sequence length (descending) for pack_padded_sequence
-    position_features, triplets, labels, lengths, resolution_kinds = zip(*batch)
-    origin_ids, modified_ids, edit_seq_ids = zip(*triplets)
-
-    # Each tuple element is a tensor; pad to same length for batch (batch_first=True)
-    position_features_padded = torch.nn.utils.rnn.pad_sequence(position_features, batch_first=True)
-    labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True)
-
-    origin_ids_padded = torch.nn.utils.rnn.pad_sequence(origin_ids, batch_first=True)
-    modified_ids_padded = torch.nn.utils.rnn.pad_sequence(modified_ids, batch_first=True)
-    edit_seq_ids_padded = torch.nn.utils.rnn.pad_sequence(edit_seq_ids, batch_first=True)
-
-    return position_features_padded, (origin_ids_padded, modified_ids_padded, edit_seq_ids_padded), labels_padded, torch.tensor(lengths), resolution_kinds
+import torch
+from pathlib import Path
+import os
+import time
+import json
+import random
+import numpy as np
+import argparse
+import torch.distributed as dist
 
 
-if __name__ == '__main__':
-    # Set random seed
-    torch.manual_seed(42)
+def seed_everything(seed=42):
+    """
+    Set a seed for reproducibility.
+    """
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
 
-    # Load data
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Train a model for edit script resolution')
+    parser.add_argument('--model', type=str, choices=['lstm', 'gru'], default='lstm',
+                        help='Model type to use (lstm or gru)')
+    args = parser.parse_args()
+    
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+
+    seed_everything()
     script_path = Path(os.path.dirname(os.path.abspath(__file__)))
-    # NOTE: The following file name is in Chinese. Consider renaming to English for public release.
-    dataset = pd.read_csv(script_path / 'data' / 'CC嵌入数据集_tokenlen32.csv')
+    
+    if accelerator.is_main_process:
+        date = time.strftime("%m-%d-%H:%M:%S", time.localtime())
+    else:
+        date = ""
+    
+    if accelerator.is_main_process:
+        with open("temp_date.txt", "w") as f:
+            f.write(date)
+    
+    accelerator.wait_for_everyone()
+    
+    if not accelerator.is_main_process:
+        with open("temp_date.txt", "r") as f:
+            date = f.read().strip()
+    
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        if os.path.exists("temp_date.txt"):
+            os.remove("temp_date.txt")
+    
+    accelerator.wait_for_everyone()
+    
+    accelerator.print("date:", date)
 
-    # Create DataSet
-    LSTM_dataset = EditScriptDataset(dataset)
-    # LSTM_dataset = Subset(LSTM_dataset, range(5000))
+    dataset_name = "codebert_mergebert_all_lang"
+    
+    model_type = args.model
+    model_output_path = (
+        script_path / "data" / "model_output" / (f"{model_type}_{dataset_name}_{date}")
+    )
+    model_params_output_name = f"model_params_{date}_{dataset_name}.json"
+    training_params_output_name = f"training_params_{date}_{dataset_name}.json"
 
-    # Calculate train/test split sizes
-    total_size = len(LSTM_dataset)
-    train_size = int(total_size * training_param.TRAIN_SPLIT)
-    test_size = total_size - train_size
+    dataset_path = (
+        script_path / "data" / "processed_data" / dataset_name
+    )
 
-    # Randomly split dataset
-    train_dataset, test_dataset = random_split(LSTM_dataset, [train_size, test_size])
+    accelerator.print(f"Initializing {model_type.upper()} model...")
+    
+    if model_type == 'gru':
+        model = GRUClassifier(
+            **model_params, CCEmbedding_class=PretrainedCCEmbedding
+        )
+        trainer_class = GRUTrainer
+    else:
+        model = LSTMClassifier(
+            **model_params, CCEmbedding_class= MergeBertCCEmbedding
+        )
+        trainer_class = LSTMTrainer
 
-    # Create DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=training_param.batch_size, shuffle=True, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=training_param.batch_size, shuffle=True, collate_fn=collate_fn)
+    if accelerator.is_main_process:
+        training_params_output_path = model_output_path / training_params_output_name
+        model_params_output_path = model_output_path / model_params_output_name
+        os.makedirs(os.path.dirname(training_params_output_path), exist_ok=True)
+        os.makedirs(os.path.dirname(model_params_output_path), exist_ok=True)
 
-    # Initialize model
-    model = LSTMClassifier(**model_params)
+        with open(training_params_output_path, "w") as f:
+            f.write(json.dumps(training_param))
+        with open(model_params_output_path, "w") as f:
+            f.write(json.dumps(model_params))
+        log_file = model_output_path / "log.txt"
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Move model to GPU if available
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f'Using {device} device')
-    model = model.to(device)
+        print(f"Total Parameters: {total_params}")
+        print(f"Trainable Parameters: {trainable_params}\n\n")
+    else:
+        log_file = None
 
-    # Define loss function and optimizer
-    criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=training_param.learning_rate)
+    trainer = trainer_class(
+        dataset_path, model, accelerator, debug=False, log_file=log_file
+    )
 
-    # Training loop
-    for epoch in range(training_param.epochs):
-        torch.cuda.empty_cache()
-        model.train()
-        total_loss = 0
-        for position_features, (origin_ids, modified_ids, edit_seq_ids), labels, lengths, _ in tqdm(train_loader, dynamic_ncols=True, desc=f'Epoch {epoch + 1}/{training_param.epochs}'):
-            # position_features shape: (batch_size, padded_seq_length, input_size)
+    train_res_df = trainer.train(model_output_path=model_output_path, date_str=date)
 
-            # Move data to device
-            position_features, origin_ids, modified_ids, edit_seq_ids, labels = position_features.to(device), origin_ids.to(device), modified_ids.to(device), edit_seq_ids.to(device), labels.to(device)
+    if train_res_df is not None:
 
-            # Forward pass
-            outputs = model(position_features, origin_ids, modified_ids, edit_seq_ids, lengths)
-            outputs = outputs.squeeze(2)
+        train_res_df.insert(0, "dataset", dataset_name)
+        train_res_df.insert(1, "cc_embedding_lr", training_param.cc_embedding_lr)
+        train_res_df.insert(2, "lstm_lr", training_param.lstm_lr)
+        train_res_df.insert(3, "fc_lr", training_param.fc_lr)
+        train_res_df.insert(4, "batch_size", training_param.batch_size)
+        train_res_df["hidden_size"] = model_params["hidden_size"]
+        train_res_df["num_layers"] = model_params["num_layers"]
+        train_res_df["bidir"] = model_params["bidirectional"]
+        train_res_df["dropout"] = model_params["dropout"]
 
-            # Use mask to ignore padded outputs
-            mask = torch.arange(outputs.size(1)).expand(len(lengths), outputs.size(1)) < lengths.unsqueeze(1)
-            mask = mask.to(device)
-            outputs_selected = outputs.masked_select(mask)
-            labels_selected = labels.masked_select(mask)
-            loss = criterion(outputs_selected, labels_selected)
-
-            # Zero gradients
-            optimizer.zero_grad()
-            # Backward and optimize
-            loss.backward()
-            total_loss += loss
-            optimizer.step()
-            torch.cuda.empty_cache()
-
-        train_loss = total_loss / len(train_loader)
-        total_loss = 0  # Reset for validation loop
-        print(f'Epoch {epoch + 1}/{training_param.epochs} | Train Loss: {train_loss}')
-
-        # Validation loop
-        with torch.inference_mode():
-            correct_num = 0
-            total_num = 0
-            kind_counter = defaultdict(int)
-            kind_correct_counter = defaultdict(int)
-            model.eval()
-            for position_features, (origin_ids, modified_ids, edit_seq_ids), labels, lengths, resolution_kinds in tqdm(test_loader, dynamic_ncols=True, desc=f'test samples in {epoch + 1}/{training_param.epochs}'):
-                curr_batch_size = len(position_features)
-                # Move data to device
-                position_features, origin_ids, modified_ids, edit_seq_ids, labels = position_features.to(device), origin_ids.to(device), modified_ids.to(device), edit_seq_ids.to(device), labels.to(device)
-
-                # Forward pass
-                outputs = model(position_features, origin_ids, modified_ids, edit_seq_ids, lengths)
-                outputs = outputs.squeeze(2)
-
-                # Only compare non-padded parts
-                mask = torch.arange(outputs.size(1)).expand(len(lengths), outputs.size(1)) < lengths.unsqueeze(1)
-                mask = mask.to(device)
-                outputs_selected = outputs.masked_select(mask)
-                labels_selected = labels.masked_select(mask)
-                loss = criterion(outputs_selected, labels_selected)
-                total_loss += loss
-
-                # Calculate accuracy
-                outputs = outputs * mask
-                labels = labels * mask
-                outputs = outputs.round().int()
-                labels = labels.int()
-
-                for i in range(curr_batch_size):
-                    kind_counter[resolution_kinds[i]] += 1
-                    if torch.equal(outputs[i], labels[i]):
-                        correct_num += 1
-                        kind_correct_counter[resolution_kinds[i]] += 1
-                total_num += curr_batch_size
-
-            test_loss = total_loss / len(test_loader)
-            print(f'Epoch {epoch + 1}/{training_param.epochs} | Test Loss: {test_loss}')
-            print(f'Accuracy: {round(correct_num / total_num * 100, 2)}%')
-            for kind in kind_counter.keys():
-                print(f'Accuracy on {kind}: {round(kind_correct_counter[kind] / kind_counter[kind] * 100, 2)}%, {kind_correct_counter[kind]}/{kind_counter[kind]}')
-            print('\n' * 2)
-
-    # Print training parameters
-    print('Training parameters:')
-    print(training_param)
-
-    # Save model
-    torch.save(model.state_dict(), script_path / 'data' / f'Bert_embedding_bs{training_param.batch_size}_lr{training_param.learning_rate}.pth')
+        train_res_df.to_csv(model_output_path / "train_res.csv", index=False)

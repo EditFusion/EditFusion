@@ -4,9 +4,9 @@ import torch
 from train_and_infer.model.Attention import Attention
 
 
-class LSTMClassifier(nn.Module):
+class GRUClassifier(nn.Module):
     """
-    LSTM model utilizing the edit script to judge whether to accept some of the edit scripts
+    GRU model utilizing the edit script to judge whether to accept some of the edit scripts
     need a CCEmbedding class to embed the input explicitly aligned code change
     """
 
@@ -22,7 +22,7 @@ class LSTMClassifier(nn.Module):
         dropout=0.2,
         **kwargs
     ):
-        super(LSTMClassifier, self).__init__(*kwargs)
+        super(GRUClassifier, self).__init__(**kwargs)
         self.input_size = input_size
         self.output_size = output_size
         self.CCEmbedding_class = CCEmbedding_class()
@@ -33,7 +33,7 @@ class LSTMClassifier(nn.Module):
         self.batch_first = True
         self.max_es_len = max_es_len
 
-        self.lstm = nn.LSTM(
+        self.gru = nn.GRU(
             input_size,
             hidden_size,
             num_layers,
@@ -57,18 +57,15 @@ class LSTMClassifier(nn.Module):
             batch_first=self.batch_first,
             enforce_sorted=True,
         )
-        lstm_out, (h_n, c_n) = self.lstm(packed)
-        lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
-            lstm_out, batch_first=self.batch_first, padding_value=12
+        gru_out, h_n = self.gru(packed)
+        gru_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
+            gru_out, batch_first=self.batch_first, padding_value=12
         )
 
-        if lstm_out.shape[1] > self.max_es_len:
-            print("lstm_out.shape[1] > self.max_es_len")
-            print(lstm_out.shape[1], self.max_es_len)
-        assert lstm_out.shape[1] <= self.max_es_len
-        if lstm_out.shape[1] < self.max_es_len:
-            lstm_out = torch.nn.functional.pad(
-                lstm_out, (0, 0, 0, self.max_es_len - lstm_out.shape[1], 0, 0), value=0
+        assert gru_out.shape[1] <= self.max_es_len
+        if gru_out.shape[1] < self.max_es_len:
+            gru_out = torch.nn.functional.pad(
+                gru_out, (0, 0, 0, self.max_es_len - gru_out.shape[1], 0, 0), value=0
             )
-        out = self.fc(lstm_out)
+        out = self.fc(gru_out)
         return out

@@ -1,103 +1,116 @@
+# EditFusion: A Deep Learning Approach to Merge Conflict Resolution
 
-# EditFusion Implementation
+This project implements a model that predicts how to resolve three-way merge conflicts by composing edit scripts from the conflicting `ours` and `theirs` branches.
 
----
-
-## Overview
-
-This repository provides a framework for training, evaluating, and serving models that infer edit scripts for code merge scenarios. It includes dataset collection, model training, and a Flask-based API for inference.
+***
 
 ## Directory Structure
 
-- `flask_service/`: REST API service for model inference.
-  - `flask_app.py`: Main Flask application.
-  - `http_test.py`: Example/test script for API requests.
-- `train_and_infer/`: Model training, evaluation, and utilities.
-  - `model/`: Model architecture definitions.
-  - `utils/`: Utility functions (edit script generation, conflict handling, tokenization, etc.).
-  - `collect_dataset.py`: Script for dataset creation and preprocessing.
-  - `train.py`: Model training entry point.
-  - `chunk_level_test.py`: Model evaluation/testing script.
-  - `infer.py`: Inference logic for serving predictions.
+-   `/flask_service`: A Flask-based web service for inference.
+    -   `flask_app.py`: The main Flask application that exposes the prediction API.
+    -   `http_test.py`: A script to test the Flask service.
+-   `/train_and_infer`: Contains scripts and modules for model training, evaluation, and inference.
+    -   `/model`: Defines the neural network architectures (e.g., LSTM, GRU) and embedding layers.
+    -   `/trainers`: Contains the training and evaluation logic for the models.
+    -   `/utils`: Includes utility functions for handling conflicts, generating edit scripts, and tokenization.
+    -   `collect_dataset.py`: Script to process raw conflict data into a trainable dataset.
+    -   `gather_conflict_data.py`: Script to aggregate conflict data from multiple sources.
+    -   `train.py`: The main script for training the model.
+    -   `chunk_level_test.py`: Script to evaluate the trained model on a test dataset.
+    -   `infer.py`: Provides the core inference function used by the Flask service.
 
-## Installation
+## Setup
 
-Install Python dependencies:
+### 1. Install Dependencies
+
+Install the required Python packages using `requirements.txt`.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Pretrained Model Setup
+### 2. Download Pre-trained Model
 
-To use the CodeBERTa model, download the pretrained weights to `train_and_infer/bert`:
+The model uses a pre-trained language model for code (e.g., CodeBERTa, GraphCodeBERT). You need to download it into the `train_and_infer/bert` directory.
 
 ```bash
+# Set working directory to EditFusion_implementation/train_and_infer/bert
 git lfs install
-git clone https://huggingface.co/huggingface/CodeBERTa-small-v1 train_and_infer/bert/CodeBERTa-small-v1
+git clone https://huggingface.co/huggingface/CodeBERTa-small-v1
 ```
 
-## Usage
+## Usage Workflow
 
-### 1. Dataset Collection
+The process involves collecting data, training a model, and deploying it for inference.
 
-1. Use [gitMergeScenario](https://github.com/Cltsu/gitMergeScenario) to collect conflict folders from repositories.
-2. Aggregate all conflict blocks into a single JSON file:
-   ```bash
-   python -m train_and_infer.gather_conflict_data
-   ```
-3. Preprocess and collect the dataset:
-   ```bash
-   python -m train_and_infer.collect_dataset
-   ```
+### 1. Data Collection
 
-#### Data Format Example
+Data collection is a three-stage process to create a dataset suitable for training.
 
-```json
-[
-  {
-    "ours": ["line1", "line2", ...],
-    "theirs": ["line1", "line2", ...],
-    "base": ["line1", "line2", ...],
-    "resolve": ["line1", "line2", ...]
-  },
-  ...
-]
+**Stage 1: Collect Raw Conflict Scenarios**
+First, use the tool in the `../gitMergeScenario` directory to mine git repositories for historical merge conflicts. This stage outputs a directory for each conflict, containing the `ours`, `theirs`, `base`, and resolved versions of the file.
+
+**Stage 2: Consolidate Conflict Data**
+Next, aggregate all the collected conflict chunks from the file system into a single JSON file. This script also assigns a preliminary `resolution_kind` label to each conflict.
+
+```bash
+# Set working directory to the project root (EditFusion_implementation)
+python -m train_and_infer.gather_conflict_data
+```
+
+**Stage 3: Generate Trainable Dataset**
+Finally, process the consolidated JSON file to generate the final dataset in CSV format. This script computes edit scripts for each conflict, filters for resolvable conflicts using a backtracking algorithm, and tokenizes the data. This process is parallelized to speed up collection.
+
+Before running, modify `collect_dataset.py` to set the input and output file paths.
+
+```bash
+# Set working directory to the project root (EditFusion_implementation)
+python -m train_and_infer.collect_dataset
 ```
 
 ### 2. Model Training
 
-Edit dataset/model paths in `train.py` as needed, then run:
+Train the model using the generated CSV dataset. Before running, you may need to adjust the dataset path and output model name inside the `train.py` script.
+
+The training process can be accelerated using `accelerate` for multi-GPU setups.
 
 ```bash
-python -m train_and_infer.train
+# Set working directory to the project root (EditFusion_implementation)
+
+# Configure accelerate for your environment
+accelerate config
+
+# Launch training
+accelerate launch -m train_and_infer.train
 ```
 
 ### 3. Model Evaluation
 
-Edit dataset/model paths in `chunk_level_test.py` as needed, then run:
+Evaluate the performance of the trained model on the test set. Modify `chunk_level_test.py` to specify the dataset and the trained model path.
 
 ```bash
+# Set working directory to the project root (EditFusion_implementation)
 python -m train_and_infer.chunk_level_test
 ```
 
-### 4. Start Flask Service
+### 4. Start Inference Service
 
-Ensure the model path in `train_and_infer/infer.py` is correct, then start the API:
+To use the model for predictions, start the Flask service. Ensure the model path in `train_and_infer/infer.py` points to your trained model.
+
+The service runs on port 5002 by default and provides the `/es_predict` endpoint.
 
 ```bash
+# Set working directory to the project root (EditFusion_implementation)
 python -m flask_service.flask_app
 ```
-Default port: 5002. Endpoint: `/es_predict` (GET/POST, params: `ours`, `theirs`, `base`).
 
-### 5. Test Flask Service
+The API accepts GET requests with three string parameters: `ours`, `theirs`, and `base`.
 
-Edit test data in `flask_service/http_test.py` as needed, then run:
+### 5. Test the Service
+
+Use the `http_test.py` script to send a sample request to the running Flask service and verify its output. You can modify the test data within the script.
 
 ```bash
+# Set working directory to the project root (EditFusion_implementation)
 python -m flask_service.http_test
 ```
-
----
-
-For questions, issues, or contributions, please open an issue or pull request.
