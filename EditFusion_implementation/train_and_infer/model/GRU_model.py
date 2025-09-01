@@ -4,9 +4,9 @@ import torch
 from train_and_infer.model.Attention import Attention
 
 
-class LSTMClassifier(nn.Module):
+class GRUClassifier(nn.Module):
     """
-    LSTM model utilizing the edit script to judge whether to accept some of the edit scripts
+    GRU model utilizing the edit script to judge whether to accept some of the edit scripts
     need a CCEmbedding class to embed the input explicitly aligned code change
     """
 
@@ -22,7 +22,7 @@ class LSTMClassifier(nn.Module):
         dropout=0.2,
         **kwargs
     ):
-        super(LSTMClassifier, self).__init__(*kwargs)
+        super(GRUClassifier, self).__init__(**kwargs)
         self.input_size = input_size
         self.output_size = output_size
         self.CCEmbedding_class = CCEmbedding_class()
@@ -33,7 +33,7 @@ class LSTMClassifier(nn.Module):
         self.batch_first = True
         self.max_es_len = max_es_len
 
-        self.lstm = nn.LSTM(
+        self.gru = nn.GRU(
             input_size,
             hidden_size,
             num_layers,
@@ -59,29 +59,19 @@ class LSTMClassifier(nn.Module):
             batch_first=self.batch_first,
             enforce_sorted=True,
         )  # 在 collate_fn 中已经排序过了
-        # LSTM
-        lstm_out, (h_n, c_n) = self.lstm(packed)
+        # GRU
+        gru_out, h_n = self.gru(packed)
         # unpack，因为 enforce_sorted=True，所以不需要返回的长度，用 batch 加载的 lengths 就可以了
-        lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
-            lstm_out, batch_first=self.batch_first, padding_value=12
+        gru_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
+            gru_out, batch_first=self.batch_first, padding_value=12
         )
 
-        # 给 lstm_output 加入 Attention
-        # mask = torch.arange(lstm_out.shape[1]).expand(len(lengths), lstm_out.shape[1]) < lengths.unsqueeze(1)   # N, L
-        # mask = mask.to(lstm_out.device)
-        # attended_output, attention_weights = self.attention(lstm_out, mask)                         # N, L, 2H
-        # # 全连接层
-        # out = self.fc(attended_output)
-
-        if lstm_out.shape[1] > self.max_es_len:
-            print("lstm_out.shape[1] > self.max_es_len")
-            print(lstm_out.shape[1], self.max_es_len)
-        assert lstm_out.shape[1] <= self.max_es_len
-        # lstm_out 填充到 N max_es_len 2H 不足的部分用 0 填充，这里用什么填应该无所谓，因为后面会用 mask 去掉填充的部分
+        assert gru_out.shape[1] <= self.max_es_len
+        # gru_out 填充到 N max_es_len 2H 不足的部分用 0 填充，这里用什么填应该无所谓，因为后面会用 mask 去掉填充的部分
         # 填充到 max_es_len 是因为在多 GPU 训练时，batch 之间的长度不同，需要填充到相同长度
-        if lstm_out.shape[1] < self.max_es_len:
-            lstm_out = torch.nn.functional.pad(
-                lstm_out, (0, 0, 0, self.max_es_len - lstm_out.shape[1], 0, 0), value=0
+        if gru_out.shape[1] < self.max_es_len:
+            gru_out = torch.nn.functional.pad(
+                gru_out, (0, 0, 0, self.max_es_len - gru_out.shape[1], 0, 0), value=0
             )
-        out = self.fc(lstm_out)
+        out = self.fc(gru_out)
         return out
