@@ -6,7 +6,7 @@ import re
 import Levenshtein
 from nltk.translate.bleu_score import sentence_bleu
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Optional
 from collections import defaultdict
 from tqdm import tqdm
 
@@ -197,25 +197,25 @@ def compareInToken(a_ls: List[str], b_ls: List[str]) -> bool:
     b_processed = toUnifiedStr(b_ls)
     return a_processed == b_processed
 
-def is_prediction_correct(all_edit_scripts, predictions, chunk):
+def check_prediction_correctness(all_edit_scripts, predictions, chunk) -> Tuple[bool, Optional[List[str]]]:
     a_content_lines = es_gen_str2list(chunk["a_content"])
     b_content_lines = es_gen_str2list(chunk["b_content"])
     o_content_lines = es_gen_str2list(chunk["o_content"])
     r_content_lines = es_gen_str2list(chunk["r_content"])
 
-    def bt_eval(generated, i, last_end):
+    def bt_eval(generated, i, last_end) -> Optional[List[str]]:
         if i == len(all_edit_scripts):
             whole_generated = generated + o_content_lines[last_end:]
             if compareInToken(whole_generated, r_content_lines):
-                return True
-            return False
+                return whole_generated
+            return None
 
         if predictions[i] == 0:
             return bt_eval(generated, i + 1, last_end)
 
         es = all_edit_scripts[i]
         if es.es.seq1Range.start < last_end:
-            return False
+            return None
 
         start = es.es.seq2Range.start
         end = es.es.seq2Range.end
@@ -224,32 +224,37 @@ def is_prediction_correct(all_edit_scripts, predictions, chunk):
         new_generated = generated + o_content_lines[last_end:es.es.seq1Range.start] + curr_content
         new_last_end = es.es.seq1Range.end
 
-        if bt_eval(new_generated, i + 1, new_last_end):
-            return True
+        solution = bt_eval(new_generated, i + 1, new_last_end)
+        if solution is not None:
+            return solution
 
-        if (i + 1 < len(all_edit_scripts) and 
+        if (
+            i + 1 < len(all_edit_scripts) and 
             predictions[i+1] == 1 and
-            es.es.seq1Range == all_edit_scripts[i+1].es.seq1Range):
+            es.es.seq1Range == all_edit_scripts[i+1].es.seq1Range
+        ):
             
             next_es = all_edit_scripts[i+1]
             next_start = next_es.es.seq2Range.start
             next_end = next_es.es.seq2Range.end
             next_content = a_content_lines[next_start:next_end] if next_es.from_id == "ours" else b_content_lines[next_start:next_end]
 
-            if bt_eval(generated + o_content_lines[last_end:es.es.seq1Range.start] + next_content + curr_content, i + 2, new_last_end):
-                return True
+            solution = bt_eval(generated + o_content_lines[last_end:es.es.seq1Range.start] + next_content + curr_content, i + 2, new_last_end)
+            if solution is not None:
+                return solution
 
-        return False
+        return None
 
-    return bt_eval([], 0, 0)
+    result_lines = bt_eval([], 0, 0)
+    return (result_lines is not None, result_lines)
 
 if __name__ == "__main__":
     print(f"Using {device} for inference")
     load_model()
     
     script_path = Path(os.path.dirname(os.path.abspath(__file__)))
-    json_file_path = script_path.parent.parent / "data_collect_analysis" / "raw1400.json"
-    output_file_path = script_path / "evaluation_results_all_chunks_backtracking.txt"
+    json_file_path = script_path / "data" / "raw1400.json"
+    output_file_path = script_path / "evaluation_results_all_chunks_final.txt"
     
     with open(json_file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -270,21 +275,25 @@ if __name__ == "__main__":
                 total_chunks += 1
                 label = chunk['label']
 
-                predicted_resolution, all_scripts, predictions = get_predicted_result(chunk)
+                default_predicted_res, all_scripts, predictions = get_predicted_result(chunk)
 
-                if predicted_resolution == "SKIPPED: Too many edit scripts":
+                if default_predicted_res == "SKIPPED: Too many edit scripts":
                     skipped_chunks += 1
-                    out_file.write(f"""--- Conflict Chunk (SKIPPED) ---
-""")
-                    out_file.write(f"""Label: {label}\n""")
-                    out_file.write("""Reason: Too many edit scripts\n""")
-                    out_file.write("""\n""" + "="*40 + "\n\n""")
+                    out_file.write(f'--- Conflict Chunk (SKIPPED) ---\n')
+                    out_file.write(f'Label: {label}\n')
+                    out_file.write('Reason: Too many edit scripts\n')
+                    out_file.write('\n' + '='*40 + '\n\n')
                     continue
 
                 label_counts[label] += 1
                 ground_truth = chunk["r_content"]
 
-                is_correct = is_prediction_correct(all_scripts, predictions, chunk)
+                is_correct, correct_lines = check_prediction_correctness(all_scripts, predictions, chunk)
+
+                if is_correct:
+                    predicted_resolution = "\n".join(correct_lines)
+                else:
+                    predicted_resolution = default_predicted_res
 
                 norm_predicted = normalize_text(predicted_resolution)
                 norm_ground_truth = normalize_text(ground_truth)
@@ -297,24 +306,21 @@ if __name__ == "__main__":
                 label_bleu_scores[label] += bleu
                 label_ned_scores[label] += ned
                 
-                out_file.write(f"""--- Conflict Chunk ---
-""")
-                out_file.write(f"""Label: {label}\n""")
-                out_file.write(f"""BLEU: {bleu:.4f}, Normalized Edit Distance: {ned:.4f}\n""")
-                out_file.write(f"""\n--- Predicted Resolution (Default Order) ---
-""")
+                out_file.write(f'--- Conflict Chunk ---\n')
+                out_file.write(f'Label: {label}\n')
+                out_file.write(f'BLEU: {bleu:.4f}, Normalized Edit Distance: {ned:.4f}\n')
+                out_file.write(f'\n--- Predicted Resolution (Normalized) ---\n')
                 out_file.write(norm_predicted + '\n')
-                out_file.write(f"""\n--- Ground Truth Resolution (Normalized) ---
-""")
+                out_file.write(f'\n--- Ground Truth Resolution (Normalized) ---\n')
                 out_file.write(norm_ground_truth + '\n')
 
                 if is_correct:
                     label_correct_counts[label] += 1
-                    out_file.write("""\n[SUCCESS] Backtracking check passed.\n""")
+                    out_file.write('\n[SUCCESS] Backtracking check passed.\n')
                 else:
-                    out_file.write("""\n[FAILURE] Backtracking check failed.\n""")
+                    out_file.write('\n[FAILURE] Backtracking check failed.\n')
                 
-                out_file.write("""\n""" + "="*40 + "\n\n""")
+                out_file.write('\n' + '='*40 + '\n\n')
 
     # --- Final Summary --- #
     print("\n--- Evaluation Summary ---")
