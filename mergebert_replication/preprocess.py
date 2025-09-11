@@ -1,12 +1,12 @@
-# This script will preprocess the raw JSON data from the dataset
-# into a format suitable for training the MergeBERT model.
-
 import os
 import json
 import random
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from utils import tokenize_and_token_level_diff3, align_and_get_edit_sequence
+from utils import token_level_merge, align_and_get_edit_sequence, apply_pattern, compare_token_lists, normalize_code
+import logging
+from collections import Counter
+from multiprocessing import Pool, cpu_count
 
 # Constants
 DATA_DIR = "/home/foril/projects/EditFusion/EditFusion_implementation/train_and_infer/data/gathered_data/mergebert_all_lang_with_no_newline/"
@@ -14,119 +14,176 @@ OUTPUT_DIR = "/home/foril/projects/EditFusion/mergebert_replication/data/"
 MODEL_PATH = "/home/foril/projects/EditFusion/mergebert_replication/CodeBERTa-small-v1/"
 MAX_LENGTH = 512
 
-# We need to map the string labels to integer IDs.
-# For the MVP, we'll only use the basic patterns.
 LABEL_MAP = {
-    "A": 0,
-    "B": 1,
-    "O": 2,
-    "AB": 3,
-    "BA": 4,
+    "select_a": 0,
+    "select_b": 1,
+    "select_o": 2,
+    "concat_ab": 3,
+    "concat_ba": 4,
+    "select_a_del_o": 5,
+    "select_b_del_o": 6,
+    "concat_ab_del_o": 7,
+    "concat_ba_del_o": 8,
 }
-# The paper mentions 9 patterns, but we'll start with these 5.
 
-def preprocess_data(file_path, tokenizer):
-    """Processes a single raw data file."""
-    processed_samples = []
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+# Global tokenizer for multiprocessing
+tokenizer = None
 
-    for item in tqdm(data, desc=f"Processing {os.path.basename(file_path)}"):
-        if 'conflict_chunks' not in item:
+def init_worker(model_path):
+    global tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+def process_item(item):
+    global tokenizer
+    stats = Counter()
+    samples = []
+
+    if 'conflict_chunks' not in item:
+        return samples, stats
+
+    for chunk in item['conflict_chunks']:
+        stats["total_chunks"] += 1
+
+        a_text = chunk.get('a_content', '')
+        b_text = chunk.get('b_content', '')
+        o_text = chunk.get('o_content', '')
+        r_text = chunk.get('r_content', '')
+
+        if a_text.count('\n') > 50 or b_text.count('\n') > 50 or o_text.count('\n') > 50:
+            stats["large_chunks_skipped"] += 1
             continue
 
-        for chunk in item['conflict_chunks']:
-            label = chunk.get('label')
-            if label not in LABEL_MAP:
-                continue
+        a_text_norm = normalize_code(a_text)
+        b_text_norm = normalize_code(b_text)
+        o_text_norm = normalize_code(o_text)
+        r_text_norm = normalize_code(r_text)
 
-            a_chunk = chunk.get('a_content', '')
-            b_chunk = chunk.get('b_content', '')
-            o_chunk = chunk.get('o_content', '')
+        a_tokens = tokenizer.tokenize(a_text_norm)
+        b_tokens = tokenizer.tokenize(b_text_norm)
+        o_tokens = tokenizer.tokenize(o_text_norm)
+        r_tokens = tokenizer.tokenize(r_text_norm)
 
-            # Perform token-level diff3
-            token_conflicts = tokenize_and_token_level_diff3(a_chunk, b_chunk, o_chunk, tokenizer)
+        if len(a_tokens) > 1000 or len(b_tokens) > 1000 or len(o_tokens) > 1000 or len(r_tokens) > 1000:
+            stats["token_limit_skipped"] += 1
+            continue
 
-            # MVP Simplification: Only handle one-to-one mappings
-            if len(token_conflicts) != 1:
-                continue
-            
-            conflict = token_conflicts[0]
-            a_tokens = conflict['a']
-            b_tokens = conflict['b']
-            o_tokens = conflict['o']
+        hunks = token_level_merge(a_tokens, b_tokens, o_tokens)
+        conflict_hunks = [h for h in hunks if isinstance(h, tuple)]
 
-            # Align sequences and get edit scripts
-            a_o_aligned, o_a_aligned, delta_ao = align_and_get_edit_sequence(a_tokens, o_tokens)
-            b_o_aligned, o_b_aligned, delta_bo = align_and_get_edit_sequence(b_tokens, o_tokens)
+        if len(conflict_hunks) == 0:
+            stats["no_conflict_chunks"] += 1
+            merged_tokens = hunks[0] if hunks else []
+            if compare_token_lists(merged_tokens, r_tokens):
+                stats["pseudo_conflict_resolved_cleanly"] += 1
+            continue
 
-            # Convert tokens to IDs and pad/truncate
-            def process_sequence(seq):
-                ids = tokenizer.convert_tokens_to_ids(seq)
-                if len(ids) > MAX_LENGTH:
-                    ids = ids[:MAX_LENGTH]
-                else:
-                    ids += [tokenizer.pad_token_id] * (MAX_LENGTH - len(ids))
-                return ids
+        if len(conflict_hunks) > 1:
+            stats["multi_conflict_chunks"] += 1
+            continue
+        
+        conflict_idx = -1
+        for i, hunk in enumerate(hunks):
+            if isinstance(hunk, tuple):
+                conflict_idx = i
+                break
+        
+        prefix_tokens = [token for hunk in hunks[:conflict_idx] for token in hunk]
+        suffix_tokens = [token for hunk in hunks[conflict_idx+1:] for token in hunk]
+        a_conflict, b_conflict, o_conflict = conflict_hunks[0]
 
-            a_o_ids = process_sequence(a_o_aligned)
-            o_a_ids = process_sequence(o_a_aligned)
-            b_o_ids = process_sequence(b_o_aligned)
-            o_b_ids = process_sequence(o_b_aligned)
-            
-            # For the MVP, we are not yet creating the edit type embeddings.
-            # We will just store the processed token sequences.
-            
-            processed_samples.append({
-                "a_o_aligned": a_o_ids,
-                "o_a_aligned": o_a_ids,
-                "b_o_aligned": b_o_ids,
-                "o_b_aligned": o_b_ids,
-                # "delta_ao": delta_ao, # Store for later use
-                # "delta_bo": delta_bo, # Store for later use
-                "label": LABEL_MAP[label]
-            })
+        found_resolution = False
+        for pattern_name, label_id in LABEL_MAP.items():
+            resolved_conflict = apply_pattern(pattern_name, a_conflict, b_conflict, o_conflict)
+            if resolved_conflict is None: continue
+            reconstructed_tokens = prefix_tokens + resolved_conflict + suffix_tokens
 
-    return processed_samples
+            if compare_token_lists(reconstructed_tokens[:MAX_LENGTH], r_tokens[:MAX_LENGTH]):
+                stats["resolvable_chunks"] += 1
+                stats[f"label_{pattern_name}"] += 1
+                
+                a_o_aligned, o_a_aligned, _ = align_and_get_edit_sequence(a_tokens, o_tokens)
+                b_o_aligned, o_b_aligned, _ = align_and_get_edit_sequence(b_tokens, o_tokens)
+
+                def process_sequence(seq):
+                    ids = tokenizer.convert_tokens_to_ids(seq)
+                    if len(ids) > MAX_LENGTH: ids = ids[:MAX_LENGTH]
+                    else: ids += [tokenizer.pad_token_id] * (MAX_LENGTH - len(ids))
+                    return ids
+
+                samples.append({
+                    "a_o_aligned": process_sequence(a_o_aligned),
+                    "o_a_aligned": process_sequence(o_a_aligned),
+                    "b_o_aligned": process_sequence(b_o_aligned),
+                    "o_b_aligned": process_sequence(o_b_aligned),
+                    "label": label_id
+                })
+                found_resolution = True
+                break
+        
+        if not found_resolution:
+            stats["unresolvable_chunks"] += 1
+    return samples, stats
 
 def main():
-    """Main function to run the preprocessing."""
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.FileHandler("preprocessing.log"), logging.StreamHandler()])
 
-    # For the MVP, we'll process one file.
-    # In a full implementation, we would process all files.
-    json_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.json')]
-    if not json_files:
-        print(f"No JSON files found in {DATA_DIR}")
-        return
+    dataset_name = os.path.basename(os.path.normpath(DATA_DIR))
+    processed_file_path = os.path.join(OUTPUT_DIR, f"{dataset_name}_all_processed.json")
 
-    all_samples = []
-    for file_name in json_files:
-        file_path = os.path.join(DATA_DIR, file_name)
-        all_samples.extend(preprocess_data(file_path, tokenizer))
+    if os.path.exists(processed_file_path):
+        logging.info(f"Processed file already exists: {processed_file_path}. Skipping preprocessing.")
+        with open(processed_file_path, 'r', encoding='utf-8') as f:
+            all_samples = json.load(f)
+    else:
+        logging.info(f"Starting preprocessing. Full log will be in preprocessing.log")
+        all_items = []
+        json_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.json')]
+        for file_name in json_files:
+            file_path = os.path.join(DATA_DIR, file_name)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                all_items.extend(data)
+        
+        all_samples = []
+        overall_stats = Counter()
 
-    # Shuffle and split the data
+        num_processes = 14
+        logging.info(f"Using {num_processes} processes for preprocessing.")
+
+        with Pool(processes=num_processes, initializer=init_worker, initargs=(MODEL_PATH,)) as pool:
+            results = list(tqdm(pool.imap(process_item, all_items), total=len(all_items)))
+
+        for samples, stats in results:
+            all_samples.extend(samples)
+            overall_stats.update(stats)
+
+        logging.info("\n--- Overall Data Processing Statistics ---")
+        for key, value in sorted(overall_stats.items()):
+            logging.info(f"{key}: {value}")
+        logging.info("------------------------------------------\n")
+
+        with open(processed_file_path, 'w', encoding='utf-8') as f:
+            json.dump(all_samples, f)
+        logging.info(f"Saved all {len(all_samples)} processed samples to {processed_file_path}")
+
     random.shuffle(all_samples)
-    
-    # 80/20 split for train/validation
     split_idx = int(len(all_samples) * 0.8)
     train_samples = all_samples[:split_idx]
     val_samples = all_samples[split_idx:]
 
-    print(f"Total samples: {len(all_samples)}")
-    print(f"Training samples: {len(train_samples)}")
-    print(f"Validation samples: {len(val_samples)}")
+    logging.info(f"Total samples for training/validation: {len(all_samples)}")
+    logging.info(f"Training samples: {len(train_samples)}")
+    logging.info(f"Validation samples: {len(val_samples)}")
 
-    # Save the processed data
-    with open(os.path.join(OUTPUT_DIR, "train.json"), 'w', encoding='utf-8') as f:
+    train_file = os.path.join(OUTPUT_DIR, f"{dataset_name}_train.json")
+    val_file = os.path.join(OUTPUT_DIR, f"{dataset_name}_validation.json")
+
+    with open(train_file, 'w', encoding='utf-8') as f:
         json.dump(train_samples, f)
-        
-    with open(os.path.join(OUTPUT_DIR, "validation.json"), 'w', encoding='utf-8') as f:
+    with open(val_file, 'w', encoding='utf-8') as f:
         json.dump(val_samples, f)
 
-    print(f"Processed data saved to {OUTPUT_DIR}")
-
+    logging.info(f"Processed data saved to {train_file} and {val_file}")
 
 if __name__ == "__main__":
     main()

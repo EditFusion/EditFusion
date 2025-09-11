@@ -7,3 +7,4 @@ tqdm
 diff-match-patch
 tree-sitter
 tree-sitter-languages
+GitPython

@@ -12,12 +12,16 @@ from tqdm import tqdm
 
 from model import MergeBERTModel
 
+import logging
+
+from collections import Counter
+
 # Constants
 DATA_DIR = "/home/foril/projects/EditFusion/mergebert_replication/data/"
 MODEL_PATH = "/home/foril/projects/EditFusion/mergebert_replication/CodeBERTa-small-v1/"
 SAVED_MODEL_DIR = "/home/foril/projects/EditFusion/mergebert_replication/saved_models/"
-NUM_LABELS = 5 # A, B, O, AB, BA
-EPOCHS = 3
+NUM_LABELS = 9 # A, B, O, AB, BA
+EPOCHS = 10
 BATCH_SIZE = 16 # Using a smaller batch size due to potential memory constraints
 LEARNING_RATE = 5e-5
 
@@ -102,15 +106,29 @@ def eval_epoch(model, data_loader, device):
 
     avg_loss = total_loss / len(data_loader)
     metrics = compute_metrics(all_preds, all_labels)
+    
+    # Calculate and log predicted label distribution
+    pred_dist = Counter(all_preds)
+    logging.info(f"Predicted label distribution: {pred_dist}")
+
     return avg_loss, metrics
 
 def main():
     """Main function to run the training."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler("training.log"),
+            logging.StreamHandler()
+        ]
+    )
 
-    train_dataset = MergeDataset(os.path.join(DATA_DIR, "train.json"))
-    val_dataset = MergeDataset(os.path.join(DATA_DIR, "validation.json"))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
+
+    train_dataset = MergeDataset(os.path.join(DATA_DIR, "mergebert_all_lang_train.json"))
+    val_dataset = MergeDataset(os.path.join(DATA_DIR, "mergebert_all_lang_validation.json"))
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
@@ -119,7 +137,7 @@ def main():
     model.to(device)
 
     if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
+        logging.info(f"Using {torch.cuda.device_count()} GPUs!")
         model = nn.DataParallel(model)
 
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
@@ -129,20 +147,20 @@ def main():
     best_val_accuracy = 0
 
     for epoch in range(EPOCHS):
-        print(f"Epoch {epoch + 1}/{EPOCHS}")
+        logging.info(f"Epoch {epoch + 1}/{EPOCHS}")
         train_loss = train_epoch(model, train_loader, optimizer, scheduler, device)
-        print(f"Train loss: {train_loss:.4f}")
+        logging.info(f"Train loss: {train_loss:.4f}")
 
         val_loss, metrics = eval_epoch(model, val_loader, device)
-        print(f"Validation loss: {val_loss:.4f}")
-        print(f"Validation metrics: {metrics}")
+        logging.info(f"Validation loss: {val_loss:.4f}")
+        logging.info(f"Validation metrics: {metrics}")
 
         if metrics['accuracy'] > best_val_accuracy:
             best_val_accuracy = metrics['accuracy']
             # If using DataParallel, the model is wrapped in a module
             model_to_save = model.module if hasattr(model, 'module') else model
             torch.save(model_to_save.state_dict(), os.path.join(SAVED_MODEL_DIR, 'mergebert.pt'))
-            print(f"Best model saved to {SAVED_MODEL_DIR}")
+            logging.info(f"Best model saved to {SAVED_MODEL_DIR}")
 
 if __name__ == "__main__":
     main()
