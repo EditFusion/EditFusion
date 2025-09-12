@@ -37,12 +37,20 @@ def process_item(item):
     global tokenizer
     stats = Counter()
     samples = []
+    detailed_stats = {
+        "A": Counter(), "B": Counter(), "AB": Counter(), "BA": Counter(),
+        "mixline": Counter(), "O": Counter(), "unknown": Counter()
+    }
 
     if 'conflict_chunks' not in item:
-        return samples, stats
+        return samples, stats, detailed_stats
 
     for chunk in item['conflict_chunks']:
         stats["total_chunks"] += 1
+        descriptive_label = chunk.get('label', 'unknown')
+        if descriptive_label not in detailed_stats:
+            descriptive_label = "unknown"
+        detailed_stats[descriptive_label]["total"] += 1
 
         a_text = chunk.get('a_content', '')
         b_text = chunk.get('b_content', '')
@@ -51,6 +59,7 @@ def process_item(item):
 
         if a_text.count('\n') > 50 or b_text.count('\n') > 50 or o_text.count('\n') > 50:
             stats["large_chunks_skipped"] += 1
+            detailed_stats[descriptive_label]["large_chunks_skipped"] += 1
             continue
 
         a_text_norm = normalize_code(a_text)
@@ -65,6 +74,7 @@ def process_item(item):
 
         if len(a_tokens) > 1000 or len(b_tokens) > 1000 or len(o_tokens) > 1000 or len(r_tokens) > 1000:
             stats["token_limit_skipped"] += 1
+            detailed_stats[descriptive_label]["token_limit_skipped"] += 1
             continue
 
         hunks = token_level_merge(a_tokens, b_tokens, o_tokens)
@@ -72,13 +82,16 @@ def process_item(item):
 
         if len(conflict_hunks) == 0:
             stats["no_conflict_chunks"] += 1
+            detailed_stats[descriptive_label]["no_conflict_chunks"] += 1
             merged_tokens = hunks[0] if hunks else []
             if compare_token_lists(merged_tokens, r_tokens):
                 stats["pseudo_conflict_resolved_cleanly"] += 1
+                detailed_stats[descriptive_label]["pseudo_conflict_resolved_cleanly"] += 1
             continue
 
         if len(conflict_hunks) > 1:
             stats["multi_conflict_chunks"] += 1
+            detailed_stats[descriptive_label]["multi_conflict_chunks"] += 1
             continue
         
         conflict_idx = -1
@@ -99,7 +112,9 @@ def process_item(item):
 
             if compare_token_lists(reconstructed_tokens[:MAX_LENGTH], r_tokens[:MAX_LENGTH]):
                 stats["resolvable_chunks"] += 1
+                detailed_stats[descriptive_label]["resolvable_chunks"] += 1
                 stats[f"label_{pattern_name}"] += 1
+                stats[f"descriptive_label_{chunk.get('label', 'unknown')}"] += 1
                 
                 a_o_aligned, o_a_aligned, _ = align_and_get_edit_sequence(a_tokens, o_tokens)
                 b_o_aligned, o_b_aligned, _ = align_and_get_edit_sequence(b_tokens, o_tokens)
@@ -115,14 +130,16 @@ def process_item(item):
                     "o_a_aligned": process_sequence(o_a_aligned),
                     "b_o_aligned": process_sequence(b_o_aligned),
                     "o_b_aligned": process_sequence(o_b_aligned),
-                    "label": label_id
+                    "numeric_label": label_id,
+                    "descriptive_label": chunk.get('label', 'unknown')
                 })
                 found_resolution = True
                 break
         
         if not found_resolution:
             stats["unresolvable_chunks"] += 1
-    return samples, stats
+            detailed_stats[descriptive_label]["unresolvable_chunks"] += 1
+    return samples, stats, detailed_stats
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.FileHandler("preprocessing.log"), logging.StreamHandler()])
@@ -130,12 +147,13 @@ def main():
     dataset_name = os.path.basename(os.path.normpath(DATA_DIR))
     processed_file_path = os.path.join(OUTPUT_DIR, f"{dataset_name}_all_processed.json")
 
+    logging.info(f"Starting preprocessing. Full log will be in preprocessing.log")
     if os.path.exists(processed_file_path):
-        logging.info(f"Processed file already exists: {processed_file_path}. Skipping preprocessing.")
+        logging.warning(f"Found existing processed file: {processed_file_path}.")
+        logging.warning("To generate new statistics, please delete this file and run the script again.")
         with open(processed_file_path, 'r', encoding='utf-8') as f:
             all_samples = json.load(f)
     else:
-        logging.info(f"Starting preprocessing. Full log will be in preprocessing.log")
         all_items = []
         json_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.json')]
         for file_name in json_files:
@@ -144,8 +162,18 @@ def main():
                 data = json.load(f)
                 all_items.extend(data)
         
+        # --- START of new code for sampling ---
+        sample_size = int(len(all_items))
+        all_items = all_items[:sample_size]
+        logging.info(f"Running a preview on {len(all_items)} items (10% of total).")
+        # --- END of new code for sampling ---
+
         all_samples = []
         overall_stats = Counter()
+        overall_detailed_stats = {
+            "A": Counter(), "B": Counter(), "AB": Counter(), "BA": Counter(),
+            "mixline": Counter(), "O": Counter(), "unknown": Counter()
+        }
 
         num_processes = 14
         logging.info(f"Using {num_processes} processes for preprocessing.")
@@ -153,14 +181,40 @@ def main():
         with Pool(processes=num_processes, initializer=init_worker, initargs=(MODEL_PATH,)) as pool:
             results = list(tqdm(pool.imap(process_item, all_items), total=len(all_items)))
 
-        for samples, stats in results:
+        for samples, stats, detailed_stats in results:
             all_samples.extend(samples)
             overall_stats.update(stats)
+            for label, counters in detailed_stats.items():
+                if label in overall_detailed_stats:
+                    overall_detailed_stats[label].update(counters)
 
         logging.info("\n--- Overall Data Processing Statistics ---")
         for key, value in sorted(overall_stats.items()):
             logging.info(f"{key}: {value}")
         logging.info("------------------------------------------\n")
+
+        logging.info("\n--- Conflict Resolution Statistics by Category ---")
+        for label, counters in sorted(overall_detailed_stats.items()):
+            total = counters.get('total', 0)
+            if total == 0:
+                continue
+            
+            resolvable = counters.get('resolvable_chunks', 0)
+            multi_conflict = counters.get('multi_conflict_chunks', 0)
+            unresolvable = counters.get('unresolvable_chunks', 0)
+            pseudo_conflict = counters.get('pseudo_conflict_resolved_cleanly', 0)
+            
+            resolvable_percent = (resolvable / total) * 100 if total > 0 else 0
+            multi_conflict_percent = (multi_conflict / total) * 100 if total > 0 else 0
+            unresolvable_percent = (unresolvable / total) * 100 if total > 0 else 0
+            pseudo_conflict_percent = (pseudo_conflict / total) * 100 if total > 0 else 0
+
+            logging.info(f"Category: {label} (Total: {total})")
+            logging.info(f"  - Resolvable: {resolvable} ({resolvable_percent:.2f}%)")
+            logging.info(f"  - Multi-conflict-chunks: {multi_conflict} ({multi_conflict_percent:.2f}%)")
+            logging.info(f"  - Unresolvable: {unresolvable} ({unresolvable_percent:.2f}%)")
+            logging.info(f"  - Pseudo-conflict resolved cleanly: {pseudo_conflict} ({pseudo_conflict_percent:.2f}%)")
+        logging.info("--------------------------------------------------\n")
 
         with open(processed_file_path, 'w', encoding='utf-8') as f:
             json.dump(all_samples, f)
