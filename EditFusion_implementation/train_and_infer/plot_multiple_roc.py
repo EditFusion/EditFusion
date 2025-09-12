@@ -18,7 +18,8 @@ def plot_multiple_roc_curves(data_files=None, output_path="combined_roc_curve.pn
         colors: List of colors for ROC curves. If None, default colors are used.
         title: Title for the plot. If None, a default title is used.
     """
-    plt.figure(figsize=(12, 10))
+    plt.rcParams.update({'font.size': 18})
+    plt.figure(figsize=(16, 14))
     
     # Add light shading to differentiate performance regions
     plt.fill_between([0, 1], [0, 1], [0, 0], color='lightgray', alpha=0.3, label='Worse than random')
@@ -48,7 +49,7 @@ def plot_multiple_roc_curves(data_files=None, output_path="combined_roc_curve.pn
                 
             labels = data['labels']
             probs = data['probabilities']
-            model_name = data.get('model_name', os.path.basename(file_path).replace('_roc_data.pkl', ''))
+            model_name = os.path.basename(file_path).replace('.pkl', '')
             
             # Calculate ROC curve and AUC
             fpr, tpr, _ = roc_curve(labels, probs)
@@ -67,22 +68,23 @@ def plot_multiple_roc_curves(data_files=None, output_path="combined_roc_curve.pn
     
     # Add annotations to explain the plot
     plt.annotate('Perfect classifier', xy=(0.0, 1.0), xytext=(0.3, 0.8),
-                 arrowprops=dict(facecolor='green', shrink=0.05), fontsize=12)
+                 arrowprops=dict(facecolor='green', shrink=0.05))
                  
     plt.annotate('Random classifier', xy=(0.5, 0.5), xytext=(0.6, 0.4),
-                 arrowprops=dict(facecolor='navy', shrink=0.05), fontsize=12)
+                 arrowprops=dict(facecolor='navy', shrink=0.05))
     
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate (1 - Specificity)', fontsize=14)
-    plt.ylabel('True Positive Rate (Sensitivity)', fontsize=14)
+    plt.xlabel('False Positive Rate (1 - Specificity)')
+    plt.ylabel('True Positive Rate (Sensitivity)')
     
     if title:
-        plt.title(f"{title}\nUnderstanding ROC Curve Performance", fontsize=16)
+        plt.title(f"{title}\nUnderstanding ROC Curve Performance")
     else:
-        plt.title('Comparison of ROC Curves\nUnderstanding Model Performance', fontsize=16)
+        plt.title('Comparison of ROC Curves\nUnderstanding Model Performance')
     
-    plt.legend(loc="lower right", fontsize=12)
+    plt.legend(loc="lower right")
+
     plt.grid(True, linestyle='--', alpha=0.5)
     
     # Add explanation text box
